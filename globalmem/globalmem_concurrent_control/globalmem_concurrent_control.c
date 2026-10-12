@@ -5,7 +5,7 @@
  * @contact : nickily233@gmail.com
  * @github : https://github.com/nickily233-svg
  */
-#include "globalmem.h"
+#include "globalmem_concurrent_control.h"
 /*
  * 局部变量
  */
@@ -15,6 +15,22 @@ module_param(globalmem_major, int, S_IRUGO);
  * 实例化设备结构体
  */
 struct globalmem_dev *globalmem_devp;
+/*
+ * 打开函数
+ * @desc:当应用程序调用 open()
+ * 打开设备文件时,该函数被内核调用,通常用于初始化设备的私有数据
+ * @param1 inode:文件索引节点指针,包含设备号等关键信息
+ * @param2 filp:文件结构体指针,用于保存设备的私有数据(将
+ * globalmem_devp赋值给filp->private_data)
+ * @retval:成功时返回0,失败时返回负值(如-EBUSY等)
+ */
+static int global_open(struct inode *inode, struct file *filp) {
+  // 设置私有数据
+  struct globalmem_dev *dev =
+      container_of(inode->i_cdev, struct globalmem_dev, cdev);
+  filp->private_data = dev;
+  return 0;
+}
 /*
  * 读函数
  * @desc  从设备中读取数据
@@ -45,6 +61,7 @@ static ssize_t globalmem_read(struct file *filp, char __user *buf, size_t size,
     count = GLOBALMEM_SIZE - p;
   }
 
+  mutex_lock(&globalmem_devp->mutex);
   if (copy_to_user(buf, dev->mem + p, count)) {
     ret = -EFAULT;
   } else {
@@ -53,6 +70,7 @@ static ssize_t globalmem_read(struct file *filp, char __user *buf, size_t size,
 
     printk(KERN_INFO "read %lu bytes(s) from %llu\n", count, p);
   }
+  mutex_unlock(&globalmem_devp->mutex);
 
   return ret;
 }
@@ -82,6 +100,7 @@ static ssize_t globalmem_write(struct file *filp, const char __user *buf,
     count = GLOBALMEM_SIZE - p;
   }
 
+  mutex_lock(&globalmem_devp->mutex);
   if (copy_from_user(dev->mem + p, buf, count)) {
     return -EFAULT;
   } else {
@@ -90,6 +109,8 @@ static ssize_t globalmem_write(struct file *filp, const char __user *buf,
 
     printk(KERN_INFO "written %lu bytes(s) from %llu\n", count, p);
   }
+
+  mutex_unlock(&globalmem_devp->mutex);
 
   return ret;
 }
@@ -143,19 +164,6 @@ static loff_t globalmem_llseek(struct file *filp, loff_t offset, int orig) {
   return ret;
 }
 /*
- * 打开函数
- * @desc:当应用程序调用 open()
- * 打开设备文件时,该函数被内核调用,通常用于初始化设备的私有数据
- * @param1 inode:文件索引节点指针,包含设备号等关键信息
- * @param2 filp:文件结构体指针,用于保存设备的私有数据(将
- * globalmem_devp赋值给filp->private_data)
- * @retval:成功时返回0,失败时返回负值(如-EBUSY等)
- */
-static int global_open(struct inode *inode, struct file *filp) {
-  filp->private_data = globalmem_devp;
-  return 0;
-}
-/*
  * 释放函数
  * @desc: 当应用程序调用 close() 关闭设备文件时, 该函数被内核调用,
  * 通常用于释放资源或清理私有数据
@@ -179,7 +187,9 @@ static long global_ioctl(struct file *filp, unsigned int cmd,
 
   switch (cmd) {
   case MEM_CLEAR:
+    mutex_lock(&globalmem_devp->mutex);
     memset(dev->mem, 0, GLOBALMEM_SIZE);
+    mutex_unlock(&globalmem_devp->mutex);
     printk("globalmem被全部设置为 0");
     break;
   default:
@@ -228,14 +238,17 @@ static void golbalmem_setup_dev(struct globalmem_dev *dev, int index) {
  */
 static int __init globalmem_init(void) {
   int ret;
+  int i;
   dev_t devno = MKDEV(GLOBALMEM_MAJOR, 0);
+
+  mutex_init(&globalmem_devp->mutex);
 
   if (globalmem_major) {
     // 静态分配设备号
-    ret = register_chrdev_region(devno, 1, "globalmem");
+    ret = register_chrdev_region(devno, DEVNUM, "globalmem");
   } else {
     // 动态分配设备号
-    ret = alloc_chrdev_region(&devno, 0, 1, "globalmem");
+    ret = alloc_chrdev_region(&devno, 0, DEVNUM, "globalmem");
     globalmem_major = MAJOR(devno);
   }
   // 分配设备号错误
@@ -243,17 +256,21 @@ static int __init globalmem_init(void) {
     return ret;
   }
   // 分配内存
-  globalmem_devp = kzalloc(sizeof(struct globalmem_dev), GFP_KERNEL);
+  mutex_lock(&globalmem_devp->mutex);
+  globalmem_devp = kzalloc(sizeof(struct globalmem_dev) * DEVNUM, GFP_KERNEL);
+  mutex_unlock(&globalmem_devp->mutex);
   if (!globalmem_devp) {
     ret = -ENOMEM;
     goto fail_malloc;
   }
 
-  golbalmem_setup_dev(globalmem_devp, 0);
+  for (i = 0; i < DEVNUM; i++) {
+    golbalmem_setup_dev(globalmem_devp + i, i);
+  }
   return 0;
 
 fail_malloc:
-  unregister_chrdev_region(devno, 1);
+  unregister_chrdev_region(devno, DEVNUM);
   return ret;
 }
 module_init(globalmem_init);
@@ -263,7 +280,10 @@ module_init(globalmem_init);
  * @retval void : 空
  */
 static void __exit globalmem_exit(void) {
-  cdev_del(&globalmem_devp->cdev);
+  int i;
+  for (i = 0; i < DEVNUM; i++) {
+    cdev_del(&(globalmem_devp + i)->cdev);
+  }
   kfree(globalmem_devp);
   unregister_chrdev_region(MKDEV(globalmem_major, 0), 1);
 }

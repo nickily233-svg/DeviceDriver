@@ -1,5 +1,5 @@
 # module
-obj-m += globalmem.o
+obj-m += globalmem.o globalmem_concurrent_control.o
 # current module's dir
 PWD := $(shell pwd)
 # kernel build dir
